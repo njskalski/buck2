@@ -13,9 +13,12 @@ use std::env::VarError;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context as _;
 use buck2_re_configuration::Buck2OssReConfiguration;
@@ -267,6 +270,17 @@ where
     }
 }
 
+/// How long a call may wait for response headers before its connection is
+/// declared stalled and replaced. Fresh connections to the same frontend answer
+/// in well under a second while a stalled one never does, so a retry must not
+/// land on the same connection. ByteStream `Write` is exempt: the server answers
+/// only after the whole upload.
+const HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A stream-slot wait longer than this is logged: it means the connection's
+/// `max_concurrency_per_connection` slots are all held.
+const SLOW_SLOT_WAIT: Duration = Duration::from_secs(10);
+
 /// A channel wrapper that provides back-pressure via semaphore permits.
 ///
 /// The permit is held in the response body, so for streaming RPCs the permit
@@ -275,14 +289,18 @@ pub struct PooledChannel {
     channel: Channel,
     semaphore: PollSemaphore,
     permit: Option<OwnedSemaphorePermit>,
+    stalled: Arc<AtomicBool>,
+    slot_wait_start: Option<Instant>,
 }
 
 impl PooledChannel {
-    fn new(channel: Channel, semaphore: Arc<Semaphore>) -> Self {
+    fn new(state: &PooledChannelState) -> Self {
         Self {
-            channel,
-            semaphore: PollSemaphore::new(semaphore),
+            channel: state.channel.clone(),
+            semaphore: PollSemaphore::new(state.semaphore.clone()),
             permit: None,
+            stalled: state.stalled.clone(),
+            slot_wait_start: None,
         }
     }
 }
@@ -293,28 +311,58 @@ impl Clone for PooledChannel {
             channel: self.channel.clone(),
             semaphore: self.semaphore.clone(),
             permit: None,
+            stalled: self.stalled.clone(),
+            slot_wait_start: None,
         }
     }
 }
 
 impl Service<http::Request<tonic::body::Body>> for PooledChannel {
     type Response = http::Response<UnsyncBoxBody<Bytes, Status>>;
-    type Error = tonic::transport::Error;
+    type Error = tonic::codegen::StdError;
     type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if self.permit.is_none() {
-            self.permit = std::task::ready!(self.semaphore.poll_acquire(cx));
+            let poll = self.semaphore.poll_acquire(cx);
+            let start = *self.slot_wait_start.get_or_insert_with(Instant::now);
+            self.permit = std::task::ready!(poll);
+            self.slot_wait_start = None;
+            if start.elapsed() > SLOW_SLOT_WAIT {
+                tracing::warn!(
+                    "Waited {:?} for a free stream slot on an RE connection",
+                    start.elapsed()
+                );
+            }
         }
-        self.channel.poll_ready(cx)
+        self.channel.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let permit = self.permit.take();
+        let path = request.uri().path().to_owned();
+        let bounded = path != "/google.bytestream.ByteStream/Write";
+        let stalled = self.stalled.clone();
         let fut = self.channel.call(request);
 
         Box::pin(async move {
-            let response = fut.await?;
+            let response = if bounded {
+                match tokio::time::timeout(HEADERS_TIMEOUT, fut).await {
+                    Ok(res) => res?,
+                    Err(_) => {
+                        stalled.store(true, Ordering::Relaxed);
+                        tracing::warn!(
+                            "{path}: no response headers in {HEADERS_TIMEOUT:?}; replacing the connection"
+                        );
+                        return Err(tonic::Status::deadline_exceeded(format!(
+                            "{path}: no response headers in {HEADERS_TIMEOUT:?}"
+                        ))
+                        .into());
+                    }
+                }
+            } else {
+                fut.await?
+            };
             let (parts, body) = response.into_parts();
             match permit {
                 Some(permit) => {
@@ -334,6 +382,8 @@ impl Service<http::Request<tonic::body::Body>> for PooledChannel {
 struct PooledChannelState {
     channel: Channel,
     semaphore: Arc<Semaphore>,
+    /// Set when a call on this connection got no response headers in time.
+    stalled: Arc<AtomicBool>,
 }
 
 impl PooledChannelState {
@@ -341,6 +391,7 @@ impl PooledChannelState {
         Self {
             channel,
             semaphore: Arc::new(Semaphore::new(max_streams)),
+            stalled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -403,13 +454,23 @@ impl HostPool {
     /// 3. If at max channels, picks the next channel (back-pressure happens in poll_ready)
     async fn get(&self) -> PooledChannel {
         let mut inner = self.inner.lock().await;
+        // Replace stalled connections. Calls already on one keep their own
+        // clone of the channel; the connection closes when the last drops.
+        for state in inner.channels.iter_mut() {
+            if state.stalled.load(Ordering::Relaxed) {
+                *state = PooledChannelState::new(
+                    channel_from_endpoint(&self.endpoint),
+                    self.max_concurrency_per_connection,
+                );
+            }
+        }
         let num_channels = inner.channels.len();
 
         // Round-robin through existing channels, prefer one with capacity
         for _ in 0..num_channels {
             let state = inner.next_channel();
             if state.has_capacity() {
-                return PooledChannel::new(state.channel.clone(), state.semaphore.clone());
+                return PooledChannel::new(state);
             }
         }
 
@@ -417,7 +478,7 @@ impl HostPool {
         if num_channels < self.max_connections {
             let channel = channel_from_endpoint(&self.endpoint);
             let state = PooledChannelState::new(channel, self.max_concurrency_per_connection);
-            let pooled = PooledChannel::new(state.channel.clone(), state.semaphore.clone());
+            let pooled = PooledChannel::new(&state);
             inner.channels.push(state);
 
             return pooled;
@@ -425,7 +486,7 @@ impl HostPool {
 
         // At max channels - just return next one, back-pressure happens in poll_ready
         let state = inner.next_channel();
-        PooledChannel::new(state.channel.clone(), state.semaphore.clone())
+        PooledChannel::new(state)
     }
 }
 
