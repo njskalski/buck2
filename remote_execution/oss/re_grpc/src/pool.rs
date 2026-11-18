@@ -275,7 +275,7 @@ where
 /// in well under a second while a stalled one never does, so a retry must not
 /// land on the same connection. ByteStream `Write` is exempt: the server answers
 /// only after the whole upload.
-const HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+const HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A stream-slot wait longer than this is logged: it means the connection's
 /// `max_concurrency_per_connection` slots are all held.
